@@ -833,18 +833,6 @@ public int postSyncBarrier() {
     return postSyncBarrier(SystemClock.uptimeMillis());
 }
 ```
-##### 如何发送异步消息？
-
-
-
-##### 消息的处理过程
-
-
-
-##### 总结和注意事项
-
-
-
 ```java
 private int postSyncBarrier(long when) {
     synchronized (this) {
@@ -863,7 +851,7 @@ private int postSyncBarrier(long when) {
                 p = p.next;
             }
         }
-        // 插入同步屏障
+        // 插入同步屏障，注意这里消息屏障是不会将handler写入到message的
         if (prev != null) { // invariant: p == prev.next
             msg.next = p;
             prev.next = msg;
@@ -876,89 +864,111 @@ private int postSyncBarrier(long when) {
 }
 ```
 
-可以看到同步屏障就是一个特殊的target，哪里特殊呢？target==null，我们可以看到他并没有给target属性赋值。**那这个target有什么用呢？看next方法：**
 
-```kotlin
-Message next() {
-    ...
- 
-    // 阻塞时间
-    int nextPollTimeoutMillis = 0;
-    for (;;) {
-        ...
-        // 阻塞对应时间 
-        nativePollOnce(ptr, nextPollTimeoutMillis);
-  // 对MessageQueue进行加锁，保证线程安全
-        synchronized (this) {
-            final long now = SystemClock.uptimeMillis();
-            Message prevMsg = null;
-            Message msg = mMessages;
-            /**
-            *  1
-            */
-            if (msg != null && msg.target == null) {
-                // 同步屏障，找到下一个异步消息
-                do {
-                    prevMsg = msg;
-                    msg = msg.next;
-                } while (msg != null && !msg.isAsynchronous());
-            }
-            if (msg != null) {
-                if (now < msg.when) {
-                    // 下一个消息还没开始，等待两者的时间差
-                    nextPollTimeoutMillis = (int) Math.min(msg.when - now, Integer.MAX_VALUE);
-                } else {
-                    // 获得消息且现在要执行，标记MessageQueue为非阻塞
-                    mBlocked = false;
-                    /**
-              *  2
-              */
-                    // 一般只有异步消息才会从中间拿走消息，同步消息都是从链表头获取
-                    if (prevMsg != null) {
-                        prevMsg.next = msg.next;
-                    } else {
-                        mMessages = msg.next;
-                    }
-                    msg.next = null;
-                    msg.markInUse();
-                    return msg;
-                }
-            } else {
-                // 没有消息，进入阻塞状态
-                nextPollTimeoutMillis = -1;
-            }
- 
-            // 当调用Looper.quitSafely()时候执行完所有的消息后就会退出
-            if (mQuitting) {
-                dispose();
-                return null;
-            }
-            ...
+
+##### 如何发送异步消息？
+
++ 第一种：直接使用异步Handler，在Handler构造参数将async设为true；
+```java
+public Handler(@Nullable Callback callback, boolean async)
+```
++ 第二种：通过message.setAsynchronous(boolean async)将消息设置为异步消息；
+```java
+ public void setAsynchronous(boolean async) {
+        if (async) {
+            flags |= FLAG_ASYNCHRONOUS;
+        } else {
+            flags &= ~FLAG_ASYNCHRONOUS;
         }
-        ...
     }
-}
 ```
 
-这个方法我在前面讲过，我们重点看一下关于同步屏障的部分，看注释1的地方的代码：
+##### 消息的处理过程
 
-```kotlin
-if (msg != null && msg.target == null) {
-    // 同步屏障，找到下一个异步消息
-    do {
-        prevMsg = msg;
-        msg = msg.next;
-    } while (msg != null && !msg.isAsynchronous());
-}
+我们来看看Handler中的mAsynchronous字段有什么作用？
+在Handler的源码中可以看到，如果mAsynchronous = true，实际也是在塞入消息队列的时候，调用了message.setAsynchronous(boolean async)方法；
+```java
+    private boolean enqueueMessage(@NonNull MessageQueue queue, @NonNull Message msg,
+            long uptimeMillis) {
+        // 将msg的Target和UID、是否异步补充，调用MessageQueue的enqueueMessage
+        // enqueue 入列
+        msg.target = this;
+        msg.workSourceUid = ThreadLocalWorkSource.getUid();
+        if (mAsynchronous) {
+            msg.setAsynchronous(true);
+        }
+        return queue.enqueueMessage(msg, uptimeMillis);
+    }
 ```
 
-如果遇到同步屏障，那么会循环遍历整个链表找到标记为异步消息的Message，即isAsynchronous返回true，其他的消息会直接忽视，那么这样异步消息，就会提前被执行了。注释2的代码注意一下就可以了。
+而Message中对此字段只提供了简单的get、set方法，在MessageQueue中，我们看看next方法中是怎么利用这个异步标志位的。
+
+```java
+ @UnsupportedAppUsage
+    Message next() {
+        // ... 此处省略
+        for (;;) {
+            if (nextPollTimeoutMillis != 0) {
+                Binder.flushPendingCommands();
+            }
+
+            nativePollOnce(ptr, nextPollTimeoutMillis);
+
+            synchronized (this) {
+                // Try to retrieve the next message.  Return if found.
+                final long now = SystemClock.uptimeMillis();
+                Message prevMsg = null;
+                Message msg = mMessages;
+                // 此处是一个消息屏障，只有消息屏障才会没有target
+                // 当有消息屏障的时候，优先寻找队列中的异步消息
+                if (msg != null && msg.target == null) {
+                    // Stalled by a barrier.  Find the next asynchronous message in the queue.
+                    do {
+                        prevMsg = msg;
+                        msg = msg.next;
+                    } while (msg != null && !msg.isAsynchronous());
+                }
+                // 如果有消息屏障，这里就是找到了下一个的异步消息；
+                // 如果没有消息屏障，这里就是找到了下一个消息，同步消息和异步消息没有差异。
+                // 这样子在有消息屏障的情况下，异步消息就会被处理，而同步消息不会进行处理。
+                if (msg != null) {
+                    if (now < msg.when) {
+                        // Next message is not ready.  Set a timeout to wake up when it is ready.
+                        nextPollTimeoutMillis = (int) Math.min(msg.when - now, Integer.MAX_VALUE);
+                    } else {
+                        // Got a message.
+                        mBlocked = false;
+                        if (prevMsg != null) {
+                            prevMsg.next = msg.next;
+                        } else {
+                            mMessages = msg.next;
+                        }
+                        msg.next = null;
+                        if (DEBUG) Log.v(TAG, "Returning message: " + msg);
+                        msg.markInUse();
+                        return msg;
+                    }
+                } else {
+                    // No more messages.
+                    nextPollTimeoutMillis = -1;
+                }
+
+                // Process the quit message now that all pending messages have been handled.
+                if (mQuitting) {
+                    dispose();
+                    return null;
+                }
+            }
+        }
+    }
+
+```
 
 **注意，同步屏障不会自动移除，使用完成之后需要手动进行移除，不然会造成同步消息无法被处理**。从源码中可以看到如果不移除同步屏障，那么他会一直在那里，这样同步消息就永远无法被执行了。
 
 有了同步屏障，那么唤醒的判断条件就必须再加一个：**MessageQueue中有同步屏障且处于阻塞中，此时插入在所有异步消息前插入新的异步消息**。这个也很好理解，跟同步消息是一样的。如果把所有的同步消息先忽视，就是插入新的链表头且队列处于阻塞状态，这个时候就需要被唤醒了。看一下源码：
 
-```kotlin
+```java
 boolean enqueueMessage(Message msg, long when) {
     ...
  
@@ -1005,35 +1015,6 @@ boolean enqueueMessage(Message msg, long when) {
 
 同样，这个方法我之前讲过，把无关同步屏障的代码忽视，看到注释1处的代码。如果插入的消息是异步消息，且有同步屏障，同时MessageQueue正处于阻塞状态，那么就需要唤醒。而如果这个异步消息的插入位置不是所有异步消息之前，那么不需要唤醒，如注释2。
 
-**那我们如何发送一个异步类型的消息呢？有两种办法：**
-
-- 使用异步类型的Handler发送的全部Message都是异步的
-- 给Message标志异步
-
-Handler有一系列带Boolean类型的参数的构造器，这个参数就是决定是否是异步Handler：
-
-```kotlin
-public Handler(@NonNull Looper looper, @Nullable Callback callback, boolean async) {
-    mLooper = looper;
-    mQueue = looper.mQueue;
-    mCallback = callback;
-    // 这里赋值
-    mAsynchronous = async;
-}
-```
-
-但是异步类型的Handler构造器是标记为hide，我们无法使用，所以我们使用异步消息只有通过给Message设置异步标志：
-
-```kotlin
-public void setAsynchronous(boolean async) {
-    if (async) {
-        flags |= FLAG_ASYNCHRONOUS;
-    } else {
-        flags &= ~FLAG_ASYNCHRONOUS;
-    }
-}
-```
-
 **但是！！！！**，其实同步屏障对于我们的日常使用的话其实是没有多大用处。因为设置同步屏障和创建异步Handler的方法都是标志为hide，说明谷歌不想要我们去使用他。所以这里同步屏障也作为一个了解，可以更加全面地理解源码中的内容。
 
 > 参考：
@@ -1043,7 +1024,137 @@ public void setAsynchronous(boolean async) {
 
 ### Q7：什么是IdleHandler？
 
+答： 当MessageQueue为空或者目前没有需要执行的Message时会回调的接口对象。
 
+IdleHandler看起来好像是个Handler，但他其实只是一个有单方法的接口，也称为函数型接口：
+
+```kotlin
+public static interface IdleHandler {
+    boolean queueIdle();
+}
+```
+
+在MessageQueue中有一个List存储了IdleHandler对象，当MessageQueue没有需要被执行的Message时就会遍历回调所有的IdleHandler。所以IdleHandler主要用于在消息队列空闲的时候处理一些**轻量级**的工作。
+
+IdleHandler的调用是在next方法中：
+
+```kotlin
+Message next() {
+    // 如果looper已经退出了，这里就返回null
+    final long ptr = mPtr;
+    if (ptr == 0) {
+        return null;
+    }
+ 
+    // IdleHandler的数量
+    int pendingIdleHandlerCount = -1; 
+    // 阻塞时间
+    int nextPollTimeoutMillis = 0;
+    for (;;) {
+        if (nextPollTimeoutMillis != 0) {
+            Binder.flushPendingCommands();
+        }
+        // 阻塞对应时间 
+        nativePollOnce(ptr, nextPollTimeoutMillis);
+  // 对MessageQueue进行加锁，保证线程安全
+        synchronized (this) {
+            final long now = SystemClock.uptimeMillis();
+            Message prevMsg = null;
+            Message msg = mMessages;
+            if (msg != null && msg.target == null) {
+                // 同步屏障，找到下一个异步消息
+                do {
+                    prevMsg = msg;
+                    msg = msg.next;
+                } while (msg != null && !msg.isAsynchronous());
+            }
+            if (msg != null) {
+                if (now < msg.when) {
+                    // 下一个消息还没开始，等待两者的时间差
+                    nextPollTimeoutMillis = (int) Math.min(msg.when - now, Integer.MAX_VALUE);
+                } else {
+                    // 获得消息且现在要执行，标记MessageQueue为非阻塞
+                    mBlocked = false;
+                    // 一般只有异步消息才会从中间拿走消息，同步消息都是从链表头获取
+                    if (prevMsg != null) {
+                        prevMsg.next = msg.next;
+                    } else {
+                        mMessages = msg.next;
+                    }
+                    msg.next = null;
+                    msg.markInUse();
+                    return msg;
+                }
+            } else {
+                // 没有消息，进入阻塞状态
+                nextPollTimeoutMillis = -1;
+            }
+ 
+            // 当调用Looper.quitSafely()时候执行完所有的消息后就会退出
+            if (mQuitting) {
+                dispose();
+                return null;
+            }
+ 
+            // 当队列中的消息用完了或者都在等待时间延迟执行同时给pendingIdleHandlerCount<0
+            // 给pendingIdleHandlerCount赋值MessageQueue中IdleHandler的数量
+            if (pendingIdleHandlerCount < 0
+                    && (mMessages == null || now < mMessages.when)) {
+                pendingIdleHandlerCount = mIdleHandlers.size();
+            }
+            // 没有需要执行的IdleHanlder直接continue
+            if (pendingIdleHandlerCount <= 0) {
+                // 执行IdleHandler，标记MessageQueue进入阻塞状态
+                mBlocked = true;
+                continue;
+            }
+ 
+            // 把List转化成数组类型
+            if (mPendingIdleHandlers == null) {
+                mPendingIdleHandlers = new IdleHandler[Math.max(pendingIdleHandlerCount, 4)];
+            }
+            mPendingIdleHandlers = mIdleHandlers.toArray(mPendingIdleHandlers);
+        }
+ 
+        // 执行IdleHandler
+        for (int i = 0; i < pendingIdleHandlerCount; i++) {
+            final IdleHandler idler = mPendingIdleHandlers[i];
+            mPendingIdleHandlers[i] = null; // 释放IdleHandler的引用
+            boolean keep = false;
+            try {
+                keep = idler.queueIdle();
+            } catch (Throwable t) {
+                Log.wtf(TAG, "IdleHandler threw exception", t);
+            }
+            // 如果返回false，则把IdleHanlder移除
+            if (!keep) {
+                synchronized (this) {
+                    mIdleHandlers.remove(idler);
+                }
+            }
+        }
+ 
+        // 最后设置pendingIdleHandlerCount为0，防止再执行一次
+        pendingIdleHandlerCount = 0;
+ 
+        // 当在执行IdleHandler的时候，可能有新的消息已经进来了
+        // 所以这个时候不能阻塞，要回去循环一次看一下
+        nextPollTimeoutMillis = 0;
+    }
+}
+```
+
+代码很多，可能看着有点乱，我梳理一下逻辑，然后再回去看源码就会很清晰了：
+
+1. 当调用next方法的时候，会给`pendingIdleHandlerCount`赋值为-1
+2. 如果队列中没有需要处理的消息的时候，就会判断`pendingIdleHandlerCount`是否为`<0`，如果是则把存储IdleHandler的list的长度赋值给`pendingIdleHandlerCount`
+3. 把list中的所有IdleHandler放到数组中。这一步是为了不让在执行IdleHandler的时候List被插入新的IdleHandler，造成逻辑混乱
+4. 然后遍历整个数组执行所有的IdleHandler
+5. 最后给`pendingIdleHandlerCount`赋值为0。然后再回去看一下这个期间有没有新的消息插入。因为`pendingIdleHandlerCount`的值为0不是-1，所以IdleHandler只会在空闲的时候执行一次
+6. 同时注意，如果IdleHandler返回了false，那么执行一次之后就被丢弃了。
+
+> 参考：
+> + [Android之Handler机制（终极篇）：面试常见问题汇总，解锁大牛的乐趣 - 知乎 (zhihu.com)](https://zhuanlan.zhihu.com/p/269485733)
 
 ### Q8：一个线程可以有几个Handler？
 
